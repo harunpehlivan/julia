@@ -46,9 +46,6 @@ static int16_t heap_p;
 /* unbias state for the RNG */
 static uint64_t cong_unbias;
 
-/* for atomic snapshot */
-static uint64_t volatile snapshot_owner = -1;
-
 /* for thread sleeping */
 typedef struct thread_sleep_tag {
     int16_t sleep_state;
@@ -57,12 +54,11 @@ typedef struct thread_sleep_tag {
 } thread_sleep_t;
 
 static thread_sleep_t **all_sleep_states;
-static int16_t n_threads_sleeping;
 
-static const int16_t not_sleeping = 0;
-static const int16_t checking_for_sleeping = 1;
-static const int16_t sleeping = 2;
-static int16_t volatile sleep_check_state;
+static const int16_t not_sleeping = 0; // no thread should be sleeping
+static const int16_t checking_for_sleeping = 1; // some threads are deciding if it is safe to transition to sleeping
+static const int16_t sleeping = 2; // it is acceptable for a thread to be sleeping
+static int16_t sleep_check_state;
 
 uint64_t sleep_threshold;
 
@@ -192,87 +188,65 @@ static inline jl_task_t *multiq_deletemin(void)
 }
 
 
-/*  just_sleep()
- */
 static void just_sleep(void)
 {
-    jl_atomic_fetch_add(&n_threads_sleeping, 1);
-
     jl_ptls_t ptls = jl_get_ptls_states();
     uv_mutex_lock(&all_sleep_states[ptls->tid]->sleep_lock);
-    if (sleep_check_state == sleeping) {
+    while (jl_atomic_load(&sleep_check_state) == sleeping) {
         all_sleep_states[ptls->tid]->sleep_state = sleeping;
         uv_cond_wait(&all_sleep_states[ptls->tid]->wake_signal,
                      &all_sleep_states[ptls->tid]->sleep_lock);
-        uv_mutex_lock(&all_sleep_states[ptls->tid]->sleep_lock);
         all_sleep_states[ptls->tid]->sleep_state = not_sleeping;
     }
     uv_mutex_unlock(&all_sleep_states[ptls->tid]->sleep_lock);
-
-    jl_atomic_fetch_add(&n_threads_sleeping, -1);
 }
 
 
-/*  snapshot_and_sleep()
- */
-static void snapshot_and_sleep(void)
+static int snapshot(void)
 {
-    jl_ptls_t ptls = jl_get_ptls_states();
-    uint64_t snapshot_id = cong(UINT64_MAX, UINT64_MAX, &ptls->rngseed),
-             previous = -1;
-    assert(jl_atomic_bool_compare_exchange(&snapshot_owner, previous,
-                                           snapshot_id));
-
     int16_t i;
-    for (i = 0;  i < heap_p;  ++i) {
+    for (i = 0; i < heap_p; ++i) {
         if (heaps[i].ntasks != 0)
-            break;
+            return 0;
     }
-    if (i != heap_p) {
-        // heap has tasks, abort snapshot
-        snapshot_owner = previous;
-        return;
-    }
-
-    if (!jl_atomic_bool_compare_exchange(&snapshot_owner,
-                                         snapshot_id, previous))
-        // snapshot id changed, abort snapshot
-        return;
-    if (!jl_atomic_bool_compare_exchange(&sleep_check_state,
-                                         checking_for_sleeping, sleeping))
-        // sleep aborted
-        return;
-
-    just_sleep();
+    return 1;
 }
 
 
-/*  multiq_sleep_if_empty()
- */
-void multiq_sleep_if_empty(void)
+static void sleep_check_now(void)
 {
-sleep_start:
-    if (sleep_check_state == checking_for_sleeping) {
-        for (; ;) {
-            jl_cpu_pause();
-            if (sleep_check_state == not_sleeping)
-                break;
-            else if (sleep_check_state == sleeping)
-                goto sleep_start;
+    while (1) {
+        int16_t state = jl_atomic_load(&sleep_check_state);
+        if (state == checking_for_sleeping) {
+            // if some thread is already checking, the decision of that thread
+            // is correct for us also
+            do {
+                state = jl_atomic_load(&sleep_check_state);
+            } while (state == checking_for_sleeping);
+            if (state == not_sleeping)
+                return 0;
         }
+        else if (state == not_sleeping) {
+            // transition from sleeping ==> checking
+            if (jl_atomic_bool_compare_exchange(&sleep_check_state, not_sleeping,
+                                                checking_for_sleeping)) {
+                if (snapshot()) {
+                    // transition from checking ==> sleeping
+                    if (jl_atomic_bool_compare_exchange(&sleep_check_state, checking_for_sleeping,
+                                                    sleeping))
+                        return 1;
+                }
+                else {
+                    // transition from checking ==> not_sleeping
+                    jl_atomic_store(&sleep_check_state, not_sleeping);
+                    return 0;
+                }
+            }
+            continue;
+        }
+        assert(state == sleeping);
+        return 1;
     }
-    else if (sleep_check_state == not_sleeping) {
-        if (!jl_atomic_bool_compare_exchange(&sleep_check_state, not_sleeping,
-                                             checking_for_sleeping))
-            goto sleep_start;
-        snapshot_and_sleep();
-    }
-    else // state == sleeping
-        just_sleep();
-
-    // not racy; see just_sleep()
-    if (n_threads_sleeping == 0)
-        jl_atomic_bool_compare_exchange(&sleep_check_state, sleeping, not_sleeping);
 }
 
 
@@ -292,7 +266,7 @@ void jl_init_threadinginfra(void)
         if (!strncasecmp(cp, "infinite", 8))
             sleep_threshold = 0;
         else
-            sleep_threshold = (uint64_t)strtol(cp, NULL, 10);
+            sleep_threshold = strtoull(cp, NULL, 10);
     }
     all_sleep_states = (thread_sleep_t **)calloc(jl_n_threads, sizeof(thread_sleep_t *));
     all_sleep_states[0] = (thread_sleep_t *)calloc(1, sizeof(thread_sleep_t));
@@ -300,7 +274,6 @@ void jl_init_threadinginfra(void)
     uv_mutex_init(&all_sleep_states[0]->sleep_lock);
     uv_cond_init(&all_sleep_states[0]->wake_signal);
     sleep_check_state = not_sleeping;
-    n_threads_sleeping = 0;
 }
 
 
@@ -338,33 +311,46 @@ void jl_threadfun(void *arg)
 }
 
 
-//  sleep_after_threshold() -- if sleep_threshold cycles have passed, sleep the thread
-static void sleep_after_threshold(uint64_t *start_cycles)
+//  sleep_check_after_threshold() -- if sleep_threshold cycles have passed and there's no work to do, return 1
+static void sleep_check_after_threshold(uint64_t *start_cycles)
 {
     if (sleep_threshold) {
         if (!(*start_cycles)) {
             *start_cycles = jl_hrtime();
-            return;
+            return 0;
         }
         uint64_t elapsed_cycles = jl_hrtime() - (*start_cycles);
         if (elapsed_cycles >= sleep_threshold) {
-            multiq_sleep_if_empty();
+            if (sleep_check_now())
+                return 1;
             *start_cycles = 0;
         }
     }
+    return 0;
 }
+
+
+static void wake_thread(jl_ptls_t ptls, int16_t tid)
+{
+    if (ptls->tid != tid) {
+        uv_mutex_lock(&all_sleep_states[tid]->sleep_lock);
+        if (all_sleep_states[tid]->sleep_state == sleeping)
+            uv_cond_signal(&all_sleep_states[tid]->wake_signal);
+        uv_mutex_unlock(&all_sleep_states[tid]->sleep_lock);
+    }
+}
+
 
 JL_DLLEXPORT void jl_wakeup_thread(int16_t tid)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
 
     /* ensure thread tid is awake if necessary */
-    if (sleep_threshold && sleep_check_state == sleeping
-            && ptls->tid != tid && !_threadedregion && tid != -1) {
-        uv_mutex_lock(&all_sleep_states[tid]->sleep_lock);
-        if (all_sleep_states[tid]->sleep_state == sleeping)
-            uv_cond_signal(&all_sleep_states[tid]->wake_signal);
-        uv_mutex_unlock(&all_sleep_states[tid]->sleep_lock);
+    int16_t state = jl_atomic_exchange(&sleep_check_state, not_sleeping);
+    if (sleep_threshold && state != not_sleeping) {
+        // TODO: wake only thread tid
+        for (tid = 0; tid < jl_n_threads; tid++)
+            wake_thread(ptls, tid);
     }
 
     /* stop the event loop too */
@@ -397,6 +383,7 @@ JL_DLLEXPORT jl_task_t *jl_task_get_next(jl_value_t *getsticky)
     jl_ptls_t ptls = jl_get_ptls_states();
     // spin briefly before blocking when the workqueue is empty
     size_t spin_count = 0;
+    uint64_t start_cycles = 0;
     jl_task_t *task;
 
     while (1) {
@@ -450,6 +437,16 @@ JL_DLLEXPORT jl_task_t *jl_task_get_next(jl_value_t *getsticky)
             }
             else {
                 jl_cpu_pause();
+                if (sleep_check_after_threshold(&start_cycles)) {
+                    task = get_next_task(getsticky);
+                    if (task) {
+                        JL_UV_UNLOCK();
+                        return task;
+                    }
+                    // TODO: one thread needs to park inside libuv
+                    just_sleep();
+                    start_cycles = 0;
+                }
             }
         }
     }
